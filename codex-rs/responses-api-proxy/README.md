@@ -1,5 +1,55 @@
 # codex-responses-api-proxy
 
+## DeepSeek/R1 Chat Completions bridge
+
+The proxy can also expose Codex's expected `POST /v1/responses` endpoint while translating requests to a DeepSeek-compatible Chat Completions backend.
+
+```powershell
+cd C:\Users\test\.multiple_agents\workspaces\codex\codex-rs
+
+$env:DEEPSEEK_R1_TOKEN = '<redacted bearer token value>'
+
+Write-Output $env:DEEPSEEK_R1_TOKEN | cargo run -p codex-responses-api-proxy -- `
+  --port 60001 `
+  --http-shutdown `
+  --server-info C:\tmp\codex-r1-proxy.json `
+  --chat-completions-upstream-url http://10.29.41.253:8000/v1/chat/completions `
+  --chat-completions-host-header summarizer-a.wbx2.com `
+  --chat-completions-model deepseek-r1-32b `
+  --chat-completions-tool-field toolCalls `
+  --chat-completions-user-agent agentloop-java/0.4.0 `
+  --chat-completions-max-tokens 1000 `
+  --chat-completions-temperature 0
+```
+
+Then point Codex at the local Responses-compatible gateway:
+
+```toml
+[model_providers.deepseek-r1-responses-gateway]
+name = "DeepSeek R1 Responses Gateway"
+base_url = "http://127.0.0.1:60001/v1"
+wire_api = "responses"
+
+[profiles.r1]
+model_provider = "deepseek-r1-responses-gateway"
+model = "deepseek-r1-32b"
+```
+
+Run Codex with:
+
+```powershell
+codex -p r1
+```
+
+In bridge mode the proxy:
+
+- accepts Codex `POST /v1/responses` requests
+- converts Responses `instructions`, `input`, and function/custom tool declarations into Chat Completions `messages` plus the configured tool field, `toolCalls` by default
+- sends `thinking`, `stream`, `max_tokens`, `temperature`, `frequency_penalty`, `presence_penalty`, and `stop` fields expected by the DeepSeek-compatible backend
+- normalizes Chat Completions responses or SSE chunks back into Responses SSE events, including `response.created`, assistant message events, function/custom tool-call items, and `response.completed`
+
+The bridge is intentionally opt-in. Without `--chat-completions-upstream-url`, the proxy keeps its original strict OpenAI Responses forwarding behavior.
+
 #### tl;dr:
 
 ```

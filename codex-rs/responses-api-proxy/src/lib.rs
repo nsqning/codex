@@ -21,6 +21,7 @@ use reqwest::header::HeaderMap;
 use reqwest::header::HeaderName;
 use reqwest::header::HeaderValue;
 use serde::Serialize;
+use serde_json::json;
 use tiny_http::Header;
 use tiny_http::Method;
 use tiny_http::Request;
@@ -28,8 +29,11 @@ use tiny_http::Response;
 use tiny_http::Server;
 use tiny_http::StatusCode;
 
+mod chat_completions;
 mod dump;
 mod read_api_key;
+use chat_completions::ChatCompletionsBridgeConfig;
+use chat_completions::bridge_responses_to_chat_completions;
 use dump::ExchangeDumper;
 use read_api_key::read_auth_header_from_stdin;
 
@@ -53,6 +57,42 @@ pub struct Args {
     #[arg(long, default_value = "https://api.openai.com/v1/responses")]
     pub upstream_url: String,
 
+    /// Absolute Chat Completions URL to bridge Responses requests to.
+    #[arg(long, value_name = "URL")]
+    pub chat_completions_upstream_url: Option<String>,
+
+    /// Override the Host header used for --chat-completions-upstream-url.
+    #[arg(long, value_name = "HOST")]
+    pub chat_completions_host_header: Option<String>,
+
+    /// Override the model sent to the Chat Completions upstream.
+    #[arg(long, value_name = "MODEL")]
+    pub chat_completions_model: Option<String>,
+
+    /// Request field used for translated tool declarations.
+    #[arg(long, default_value = "toolCalls")]
+    pub chat_completions_tool_field: String,
+
+    /// User-Agent header to send to the Chat Completions upstream.
+    #[arg(long, value_name = "VALUE")]
+    pub chat_completions_user_agent: Option<String>,
+
+    /// Value for the DeepSeek-compatible `thinking` request field.
+    #[arg(long, default_value_t = false)]
+    pub chat_completions_thinking: bool,
+
+    /// Maximum completion tokens sent to the Chat Completions upstream.
+    #[arg(long, default_value_t = 1000)]
+    pub chat_completions_max_tokens: u32,
+
+    /// Temperature sent to the Chat Completions upstream.
+    #[arg(long, default_value_t = 0.0)]
+    pub chat_completions_temperature: f64,
+
+    /// Ask the Chat Completions upstream for streaming chunks before normalizing them.
+    #[arg(long, default_value_t = false)]
+    pub chat_completions_stream_upstream: bool,
+
     /// Directory where request/response dumps should be written as JSON.
     #[arg(long, value_name = "DIR")]
     pub dump_dir: Option<PathBuf>,
@@ -65,6 +105,15 @@ struct ServerInfo {
 }
 
 struct ForwardConfig {
+    mode: ForwardMode,
+}
+
+enum ForwardMode {
+    Responses(ResponsesForwardConfig),
+    ChatCompletions(ChatCompletionsBridgeConfig),
+}
+
+struct ResponsesForwardConfig {
     upstream_url: Url,
     host_header: HeaderValue,
 }
@@ -73,18 +122,43 @@ struct ForwardConfig {
 pub fn run_main(args: Args) -> Result<()> {
     let auth_header = read_auth_header_from_stdin()?;
 
-    let upstream_url = Url::parse(&args.upstream_url).context("parsing --upstream-url")?;
-    let host = match (upstream_url.host_str(), upstream_url.port()) {
-        (Some(host), Some(port)) => format!("{host}:{port}"),
-        (Some(host), None) => host.to_string(),
-        _ => return Err(anyhow!("upstream URL must include a host")),
+    let mode = if let Some(chat_completions_upstream_url) = args.chat_completions_upstream_url {
+        let upstream_url = Url::parse(&chat_completions_upstream_url)
+            .context("parsing --chat-completions-upstream-url")?;
+        let host_header = host_header_for_url(
+            &upstream_url,
+            args.chat_completions_host_header.as_deref(),
+        )?;
+        let user_agent = args
+            .chat_completions_user_agent
+            .as_deref()
+            .map(HeaderValue::from_str)
+            .transpose()
+            .context("constructing User-Agent header from --chat-completions-user-agent")?;
+
+        ForwardMode::ChatCompletions(ChatCompletionsBridgeConfig {
+            upstream_url,
+            host_header,
+            model: args.chat_completions_model,
+            tool_field: args.chat_completions_tool_field,
+            user_agent,
+            thinking: args.chat_completions_thinking,
+            max_tokens: args.chat_completions_max_tokens,
+            temperature: args.chat_completions_temperature,
+            stream_upstream: args.chat_completions_stream_upstream,
+        })
+    } else {
+        let upstream_url = Url::parse(&args.upstream_url).context("parsing --upstream-url")?;
+        let host_header = host_header_for_url(&upstream_url, None)?;
+
+        ForwardMode::Responses(ResponsesForwardConfig {
+            upstream_url,
+            host_header,
+        })
     };
-    let host_header =
-        HeaderValue::from_str(&host).context("constructing Host header from upstream URL")?;
 
     let forward_config = Arc::new(ForwardConfig {
-        upstream_url,
-        host_header,
+        mode,
     });
     let dump_dir = args
         .dump_dir
@@ -133,6 +207,18 @@ pub fn run_main(args: Args) -> Result<()> {
     }
 
     Err(anyhow!("server stopped unexpectedly"))
+}
+
+fn host_header_for_url(upstream_url: &Url, override_host: Option<&str>) -> Result<HeaderValue> {
+    let host = match override_host {
+        Some(host) => host.to_string(),
+        None => match (upstream_url.host_str(), upstream_url.port()) {
+            (Some(host), Some(port)) => format!("{host}:{port}"),
+            (Some(host), None) => host.to_string(),
+            _ => return Err(anyhow!("upstream URL must include a host")),
+        },
+    };
+    HeaderValue::from_str(&host).context("constructing Host header from upstream URL")
 }
 
 fn bind_listener(port: Option<u16>) -> Result<(TcpListener, SocketAddr)> {
@@ -218,6 +304,31 @@ fn forward_request(
     auth_header_value.set_sensitive(true);
     headers.insert(AUTHORIZATION, auth_header_value);
 
+    match &config.mode {
+        ForwardMode::Responses(config) => {
+            forward_responses_request(client, config, exchange_dump, headers, body, req)
+        }
+        ForwardMode::ChatCompletions(config) => {
+            bridge_responses_to_chat_completions(
+                client,
+                config,
+                exchange_dump,
+                headers,
+                body,
+                req,
+            )
+        }
+    }
+}
+
+fn forward_responses_request(
+    client: &Client,
+    config: &ResponsesForwardConfig,
+    exchange_dump: Option<dump::ExchangeDump>,
+    mut headers: HeaderMap,
+    body: Vec<u8>,
+    req: Request,
+) -> Result<()> {
     headers.insert(HOST, config.host_header.clone());
 
     let upstream_resp = client
@@ -272,4 +383,20 @@ fn forward_request(
 
     let _ = req.respond(response);
     Ok(())
+}
+
+pub(crate) fn respond_with_json_error(req: Request, status: StatusCode, message: &str) {
+    let body = json!({
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+        }
+    })
+    .to_string();
+    let response = Response::from_string(body).with_status_code(status);
+    let response = match Header::from_bytes(&b"content-type"[..], &b"application/json"[..]) {
+        Ok(header) => response.with_header(header),
+        Err(_) => response,
+    };
+    let _ = req.respond(response);
 }
