@@ -130,8 +130,9 @@ async fn responses_api_parent_and_subagent_requests_include_identity_headers() -
             .header("x-codex-turn-metadata")
             .ok_or_else(|| anyhow!("child request missing x-codex-turn-metadata"))?,
     )?;
+    assert!(child_turn_metadata.get("forked_from_thread_id").is_none());
     assert_eq!(
-        child_turn_metadata["forked_from_thread_id"].as_str(),
+        child_turn_metadata["parent_thread_id"].as_str(),
         Some(parent_thread_id)
     );
 
@@ -140,7 +141,7 @@ async fn responses_api_parent_and_subagent_requests_include_identity_headers() -
 
 async fn submit_turn_with_timeout(test: &TestCodex, prompt: &str) -> Result<()> {
     let session_model = test.session_configured.model.clone();
-    let cwd = test.config.cwd.to_path_buf();
+    let cwd = test.config.cwd.clone();
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::workspace_write(), cwd.as_path());
     test.codex
