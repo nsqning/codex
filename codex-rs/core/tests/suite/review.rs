@@ -136,8 +136,9 @@ async fn review_op_emits_lifecycle_and_review_output() {
             .expect("review request turn metadata"),
     )
     .expect("review request turn metadata json");
+    assert!(turn_metadata.get("forked_from_thread_id").is_none());
     assert_eq!(
-        turn_metadata["forked_from_thread_id"].as_str(),
+        turn_metadata["parent_thread_id"].as_str(),
         Some(parent_thread_id.as_str())
     );
 
@@ -820,7 +821,7 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
     core_test_support::submit_thread_settings(
         &codex,
         codex_protocol::protocol::ThreadSettingsOverrides {
-            cwd: Some(repo_path.to_path_buf()),
+            cwd: Some(repo_path.to_path_buf().abs()),
             ..Default::default()
         },
     )

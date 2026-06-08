@@ -1,13 +1,11 @@
-use std::path::Path;
-use std::path::PathBuf;
-
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_api::ImageBackground;
 use codex_api::ImageEditRequest;
 use codex_api::ImageGenerationRequest;
 use codex_api::ImageQuality;
 use codex_api::ImageUrl;
+use codex_core::context::extension_image_generation_output_hint;
+use codex_core::image_generation_artifact_path;
+use codex_extension_api::ExtensionTurnItem;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::ToolCall;
 use codex_extension_api::ToolExecutor;
@@ -16,6 +14,7 @@ use codex_extension_api::ToolOutput;
 use codex_extension_api::ToolPayload;
 use codex_extension_api::ToolSpec;
 use codex_extension_api::parse_tool_input_schema;
+use codex_protocol::items::ImageGenerationItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -28,6 +27,7 @@ use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolExposure;
 use codex_tools::default_namespace_description;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
 use schemars::r#gen::SchemaSettings;
 use serde::Deserialize;
@@ -41,20 +41,25 @@ use crate::backend::CodexImagesBackend;
 const IMAGE_MODEL: &str = "gpt-image-2";
 const MAX_EDIT_IMAGES: usize = 5;
 const IMAGEGEN_DESCRIPTION: &str = include_str!("../imagegen_description.md");
-const GENERATED_IMAGE_ARTIFACTS_DIR: &str = "generated_images";
 
 #[derive(Clone)]
 pub(crate) struct ImageGenerationTool {
     backend: CodexImagesBackend,
-    output_dir: PathBuf,
+    codex_home: AbsolutePathBuf,
+    thread_id: String,
 }
 
 impl ImageGenerationTool {
     /// Creates an image-generation tool backed by an image API executor.
-    pub(crate) fn new(backend: CodexImagesBackend, output_dir: PathBuf) -> Self {
+    pub(crate) fn new(
+        backend: CodexImagesBackend,
+        codex_home: AbsolutePathBuf,
+        thread_id: String,
+    ) -> Self {
         Self {
             backend,
-            output_dir,
+            codex_home,
+            thread_id,
         }
     }
 }
@@ -85,16 +90,24 @@ impl ToolExecutor<ToolCall> for ImageGenerationTool {
         imagegen_tool_spec()
     }
 
-    /// Keeps this model-facing tool out of the nested code-mode tool surface.
+    /// Exposes image generation directly and through the nested code-mode tool surface.
     fn exposure(&self) -> ToolExposure {
-        ToolExposure::DirectModelOnly
+        ToolExposure::Direct
     }
 
     /// Executes the selected image operation and returns the completed image result.
     async fn handle(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let args = parse_args(&call)?;
         let request = request_for_action(&args, call.conversation_history.items())?;
-
+        call.turn_item_emitter
+            .emit_started(ExtensionTurnItem::ImageGeneration(ImageGenerationItem {
+                id: call.call_id.clone(),
+                status: "in_progress".to_string(),
+                revised_prompt: None,
+                result: String::new(),
+                saved_path: None,
+            }))
+            .await;
         let response = match request {
             ImageRequest::Generate(request) => self.backend.generate(request).await,
             ImageRequest::Edit(request) => self.backend.edit(request).await,
@@ -107,18 +120,22 @@ impl ToolExecutor<ToolCall> for ImageGenerationTool {
                 "image generation returned no image data".to_string(),
             ));
         };
+        call.turn_item_emitter
+            .emit_completed(ExtensionTurnItem::ImageGeneration(ImageGenerationItem {
+                id: call.call_id.clone(),
+                status: "completed".to_string(),
+                revised_prompt: Some(args.prompt),
+                result: result.clone(),
+                saved_path: None,
+            }))
+            .await;
+        let output_path =
+            image_generation_artifact_path(&self.codex_home, &self.thread_id, &call.call_id);
+        let output_dir = output_path
+            .parent()
+            .unwrap_or_else(|| self.codex_home.clone());
         let output_hint =
-            match persist_generated_image(&self.output_dir, &call.call_id, &result).await {
-                Ok(output_hint) => Some(output_hint),
-                Err(err) => {
-                    tracing::warn!(
-                        call_id = %call.call_id,
-                        output_dir = %self.output_dir.display(),
-                        "failed to save generated image: {err}"
-                    );
-                    None
-                }
-            };
+            extension_image_generation_output_hint(output_dir.display(), output_path.display());
         Ok(Box::new(GeneratedImageOutput {
             result,
             output_hint,
@@ -225,6 +242,7 @@ fn edit_images(history: &[ResponseItem]) -> Vec<ImageUrl> {
                 ));
             }
             ResponseItem::Message { .. }
+            | ResponseItem::AgentMessage { .. }
             | ResponseItem::Reasoning { .. }
             | ResponseItem::LocalShellCall { .. }
             | ResponseItem::FunctionCall { .. }
@@ -266,58 +284,6 @@ fn truncate_images(
 fn parse_args(call: &ToolCall) -> Result<ImagegenArgs, FunctionCallError> {
     serde_json::from_str(call.function_arguments()?)
         .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))
-}
-
-/// Resolves where generated images for one thread are persisted by the extension.
-pub(crate) fn generated_image_output_dir(codex_home: &Path, thread_id: &str) -> PathBuf {
-    codex_home
-        .join(GENERATED_IMAGE_ARTIFACTS_DIR)
-        .join(sanitize_path_component(thread_id))
-}
-
-fn generated_image_output_path(output_dir: &Path, call_id: &str) -> PathBuf {
-    output_dir.join(format!("{}.png", sanitize_path_component(call_id)))
-}
-
-fn sanitize_path_component(value: &str) -> String {
-    let sanitized: String = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "generated_image".to_string()
-    } else {
-        sanitized
-    }
-}
-
-async fn persist_generated_image(
-    output_dir: &Path,
-    call_id: &str,
-    result: &str,
-) -> Result<String, String> {
-    let bytes = BASE64_STANDARD
-        .decode(result.trim().as_bytes())
-        .map_err(|err| format!("invalid image generation payload: {err}"))?;
-    tokio::fs::create_dir_all(output_dir)
-        .await
-        .map_err(|err| err.to_string())?;
-    tokio::fs::write(generated_image_output_path(output_dir, call_id), bytes)
-        .await
-        .map_err(|err| err.to_string())?;
-
-    Ok(format!(
-        "Generated images are saved to {} as {} by default.\n\
-         If you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it.",
-        output_dir.display(),
-        generated_image_output_path(output_dir, call_id).display(),
-    ))
 }
 
 /// Builds the namespace function schema exposed to the model.
@@ -369,7 +335,22 @@ impl ToolOutput for GeneratedImageOutput {
         true
     }
 
-    /// Returns generated bytes and persisted-artifact context for the model's follow-up response.
+    /// Returns the object consumed by the code-mode `generatedImage()` helper.
+    fn code_mode_result(&self, _payload: &ToolPayload) -> Value {
+        let mut result = Map::from_iter([(
+            "image_url".to_string(),
+            Value::String(format!("data:image/png;base64,{}", self.result)),
+        )]);
+        if let Some(output_hint) = &self.output_hint {
+            result.insert(
+                "output_hint".to_string(),
+                Value::String(output_hint.clone()),
+            );
+        }
+        Value::Object(result)
+    }
+
+    /// Returns generated bytes and persisted-artifact context for model follow-up.
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
         let mut content = vec![FunctionCallOutputContentItem::InputImage {
             image_url: format!("data:image/png;base64,{}", self.result),

@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_core::config::Config;
@@ -10,14 +9,13 @@ use codex_extension_api::ThreadStartInput;
 use codex_extension_api::ToolCall;
 use codex_extension_api::ToolContributor;
 use codex_extension_api::ToolExecutor;
-use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
 use crate::backend::CodexImagesBackend;
 use crate::tool::ImageGenerationTool;
-use crate::tool::generated_image_output_dir;
 
 #[derive(Clone)]
 struct ImageGenerationExtension {
@@ -26,19 +24,19 @@ struct ImageGenerationExtension {
 
 #[derive(Clone)]
 struct ImageGenerationExtensionConfig {
-    enabled: bool,
+    available: bool,
     provider: ModelProviderInfo,
-    codex_home: PathBuf,
+    codex_home: AbsolutePathBuf,
 }
 
 impl From<&Config> for ImageGenerationExtensionConfig {
     /// Resolves whether standalone image generation should be available for a thread.
     fn from(config: &Config) -> Self {
         Self {
-            enabled: config.features.enabled(Feature::ImageGenExt)
-                && config.model_provider.is_openai(),
+            // Core selects this executor per turn using the feature flag or model metadata.
+            available: config.model_provider.is_openai(),
             provider: config.model_provider.clone(),
-            codex_home: config.codex_home.to_path_buf(),
+            codex_home: config.codex_home.clone(),
         }
     }
 }
@@ -76,7 +74,7 @@ impl ToolContributor for ImageGenerationExtension {
         let Some(config) = thread_store.get::<ImageGenerationExtensionConfig>() else {
             return Vec::new();
         };
-        if !config.enabled || !self.auth_manager.current_auth_uses_codex_backend() {
+        if !config.available || !self.auth_manager.current_auth_uses_codex_backend() {
             return Vec::new();
         }
 
@@ -85,12 +83,13 @@ impl ToolContributor for ImageGenerationExtension {
                 config.provider.clone(),
                 Some(self.auth_manager.clone()),
             )),
-            generated_image_output_dir(&config.codex_home, thread_store.level_id()),
+            config.codex_home.clone(),
+            thread_store.level_id().to_string(),
         ))]
     }
 }
 
-/// Installs the feature-gated standalone image-generation extension contributors.
+/// Installs the standalone image-generation extension contributors.
 pub fn install(registry: &mut ExtensionRegistryBuilder<Config>, auth_manager: Arc<AuthManager>) {
     let extension = Arc::new(ImageGenerationExtension { auth_manager });
     registry.thread_lifecycle_contributor(extension.clone());
